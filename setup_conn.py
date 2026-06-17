@@ -1,8 +1,7 @@
-import os, boto3, json, inspect, ast
+import os, boto3, json, inspect, ast, requests
 from datetime import datetime
 from airflow.sdk import DAG, task, Variable
 from airflow.providers.standard.operators.python import PythonOperator
-from airflow.providers.http.operators.http import HttpOperator
  
 # Global Variables setup
 def set_global_variables():
@@ -133,11 +132,15 @@ def run_bash_cmd(connect_id):
 
 def create_connection_via_api(conn_id, conn_type, host=None, login=None, password=None, port=None, schema=None, description=None, extra=None):
     """
-    Prepare connection payload for Airflow 3 REST API
-    Returns a dictionary ready to be sent via HttpOperator
+    Create or update an Airflow 3 connection via REST API using requests library
     """
     print("In "+inspect.stack()[0][3]+" function" )
     
+    # Get Airflow webserver URL and token from environment
+    airflow_webserver_url = os.environ.get('AIRFLOW_WEBSERVER_URL', 'http://localhost:8080')
+    airflow_api_token = os.environ.get('AIRFLOW_API_TOKEN', '')
+    
+    # Build connection payload for Airflow 3 REST API (api/v2/connections)
     connection_data = {
         'connection_id': conn_id,
         'conn_type': conn_type,
@@ -158,10 +161,49 @@ def create_connection_via_api(conn_id, conn_type, host=None, login=None, passwor
     if extra:
         connection_data['extra'] = extra
     
-    return connection_data
+    # Prepare headers
+    headers = {
+        'Content-Type': 'application/json',
+    }
+    if airflow_api_token:
+        headers['Authorization'] = f'Bearer {airflow_api_token}'
+    
+    # Airflow 3 REST API endpoint
+    api_url = f'{airflow_webserver_url}/api/v2/connections'
+    
+    try:
+        # Check if connection already exists
+        check_url = f'{airflow_webserver_url}/api/v2/connections/{conn_id}'
+        get_response = requests.get(check_url, headers=headers, timeout=10, verify=False)
+        
+        if get_response.status_code == 200:
+            print(f"Connection {conn_id} already exists")
+            # Update existing connection using PATCH
+            patch_response = requests.patch(check_url, json=connection_data, headers=headers, timeout=10, verify=False)
+            if patch_response.status_code in [200, 204]:
+                print(f'Connection {conn_id} updated successfully via REST API')
+                return True
+            else:
+                print(f"Error updating connection: {patch_response.status_code} - {patch_response.text}")
+                return False
+        else:
+            # Create new connection using POST
+            post_response = requests.post(api_url, json=connection_data, headers=headers, timeout=10, verify=False)
+            if post_response.status_code in [200, 201]:
+                print(f'Connection {conn_id} created successfully via REST API')
+                return True
+            elif post_response.status_code == 409:
+                print(f"Connection {conn_id} already exists (409 Conflict)")
+                return True
+            else:
+                print(f"Error creating connection: {post_response.status_code} - {post_response.text}")
+                return False
+    except Exception as e:
+        print(f"Error calling Airflow REST API: {str(e)}")
+        return False
  
-def prepare_ssh_conn_payload(**kwargs):
-    """Prepare SSH connection payload from secrets"""
+def create_ssh_conn(**kwargs):
+    """Create SSH connection via Airflow 3 REST API"""
     print("In "+inspect.stack()[0][3]+" function" )
     set_global_variables()
     global priv_key_file_full_nm, airflow_user_id
@@ -180,8 +222,8 @@ def prepare_ssh_conn_payload(**kwargs):
     remove_ssh_key_file(connect_id)
     create_ssh_key_file(connect_id)
     
-    # Build SSH connection payload for REST API
-    payload = create_connection_via_api(
+    # Create SSH connection via REST API
+    create_connection_via_api(
         conn_id=connect_id_name,
         conn_type='ssh',
         host=Variable.get(host_name),
@@ -191,10 +233,9 @@ def prepare_ssh_conn_payload(**kwargs):
         description='SSH Connection to '+connect_id,
         extra=json.dumps({"key_file": priv_key_file_full_nm})
     )
-    return payload
 
-def prepare_dbricks_conn_payload(**kwargs):
-    """Prepare Databricks connection payload from secrets"""
+def create_dbricks_conn(**kwargs):
+    """Create Databricks connection via Airflow 3 REST API"""
     print("In "+inspect.stack()[0][3]+" function" )
     set_global_variables()
     connect_id = kwargs['connect_id']
@@ -209,15 +250,14 @@ def prepare_dbricks_conn_payload(**kwargs):
     host_val=Variable.get("dbricks_host_url")+".cloud.databricks.com"
     print("The host name of databricks is {0}".format(host_val))
     
-    # Build Databricks connection payload for REST API
-    payload = create_connection_via_api(
+    # Create Databricks connection via REST API
+    create_connection_via_api(
         conn_id=connect_id_name,
         conn_type='databricks',
         host=host_val,
         password=token_val,
         description='Databricks connection -'+connect_id
     )
-    return payload
  
  
 default_args = {
@@ -225,57 +265,27 @@ default_args = {
 }
 
 with DAG(dag_id='setup',
-        start_date=None,
+        start_date=datetime(2026, 1, 1),
         schedule=None,
         catchup=False,
         default_args=default_args,
         tags=["api", "infrastructure", "airflow3"]
         ) as dag:
 
-    # Task 1: Prepare SSH connection payload
-    prepare_ssh_task = PythonOperator(
-        task_id='prepare_ssh_conn_payload',
-        python_callable=prepare_ssh_conn_payload,
-        op_kwargs={'connect_id': 'psdlec2'},
-        do_xcom_push=True
-    )
-
-    # Task 2: Create SSH connection via Airflow 3 REST API
-    create_ssh_conn_task = HttpOperator(
+    # Task 1: Create SSH connection via Airflow 3 REST API
+    ssh_conn_setup = PythonOperator(
         task_id='post_ssh_connection',
-        method='POST',
-        endpoint='api/v2/connections',
-        http_conn_id='airflow_api_server_conn',
-        data='{{ ti.xcom_pull(task_ids="prepare_ssh_conn_payload") | tojson }}',
-        headers={
-            'Content-Type': 'application/json',
-        },
-        extra_options={'check_response_errors': False},
-        log_response=True,
+        python_callable=create_ssh_conn,
+        op_kwargs={'connect_id': 'psdlec2'}
     )
 
-    # Task 3: Prepare Databricks connection payload
-    prepare_dbricks_task = PythonOperator(
-        task_id='prepare_dbricks_conn_payload',
-        python_callable=prepare_dbricks_conn_payload,
-        op_kwargs={'connect_id': 'psdl'},
-        do_xcom_push=True
-    )
-
-    # Task 4: Create Databricks connection via Airflow 3 REST API
-    create_dbricks_conn_task = HttpOperator(
+    # Task 2: Create Databricks connection via Airflow 3 REST API
+    dbricks_conn_setup = PythonOperator(
         task_id='post_dbricks_connection',
-        method='POST',
-        endpoint='api/v2/connections',
-        http_conn_id='airflow_api_server_conn',
-        data='{{ ti.xcom_pull(task_ids="prepare_dbricks_conn_payload") | tojson }}',
-        headers={
-            'Content-Type': 'application/json',
-        },
-        extra_options={'check_response_errors': False},
-        log_response=True,
+        python_callable=create_dbricks_conn,
+        op_kwargs={'connect_id': 'psdl'}
     )
 
-    # Set task dependencies
-    prepare_ssh_task >> create_ssh_conn_task
-    prepare_dbricks_task >> create_dbricks_conn_task  
+    # Tasks can run in parallel
+    ssh_conn_setup
+    dbricks_conn_setup  
