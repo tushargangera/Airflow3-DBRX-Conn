@@ -1,8 +1,8 @@
 import os, boto3, json, inspect, ast
-from airflow.sdk import DAG, task, Variable, Connection
+from datetime import datetime
+from airflow.sdk import DAG, task, Variable
 from airflow.providers.standard.operators.python import PythonOperator
-from sqlalchemy.orm import Session
-from airflow.settings import engine
+from airflow.providers.http.operators.http import HttpOperator
  
 # Global Variables setup
 def set_global_variables():
@@ -130,8 +130,38 @@ def run_bash_cmd(connect_id):
     print("In "+inspect.stack()[0][3]+" function" )
     os.listdir('/usr/local/airflow/dags')
     os.listdir('/tmp')
+
+def create_connection_via_api(conn_id, conn_type, host=None, login=None, password=None, port=None, schema=None, description=None, extra=None):
+    """
+    Prepare connection payload for Airflow 3 REST API
+    Returns a dictionary ready to be sent via HttpOperator
+    """
+    print("In "+inspect.stack()[0][3]+" function" )
+    
+    connection_data = {
+        'connection_id': conn_id,
+        'conn_type': conn_type,
+    }
+    
+    if host:
+        connection_data['host'] = host
+    if login:
+        connection_data['login'] = login
+    if password:
+        connection_data['password'] = password
+    if port:
+        connection_data['port'] = port
+    if schema:
+        connection_data['schema'] = schema
+    if description:
+        connection_data['description'] = description
+    if extra:
+        connection_data['extra'] = extra
+    
+    return connection_data
  
-def create_ssh_conn(**kwargs):
+def prepare_ssh_conn_payload(**kwargs):
+    """Prepare SSH connection payload from secrets"""
     print("In "+inspect.stack()[0][3]+" function" )
     set_global_variables()
     global priv_key_file_full_nm, airflow_user_id
@@ -150,42 +180,25 @@ def create_ssh_conn(**kwargs):
     remove_ssh_key_file(connect_id)
     create_ssh_key_file(connect_id)
     
-    # Use Airflow SDK to create connection (Airflow 3.0 compatible)
-    try:
-        host_val = Variable.get(host_name)
-        user_val = Variable.get(user_id)
-        extra_json = json.dumps({"key_file": priv_key_file_full_nm})
-        
-        # Create SSH connection using Airflow SDK
-        conn = Connection(
-            conn_id=connect_id_name,
-            conn_type='ssh',
-            host=host_val,
-            login=user_val,
-            port=22,
-            extra=extra_json
-        )
-        
-        # Save the connection using database session
-        with Session(engine) as session:
-            # Delete existing connection if it exists
-            existing = session.query(Connection).filter(Connection.conn_id == connect_id_name).first()
-            if existing:
-                session.delete(existing)
-            session.add(conn)
-            session.commit()
-        
-        print(f'SSH Connection created/updated - {connect_id_name}')
-        
-    except Exception as e:
-        print(f"Error creating SSH connection: {str(e)}")
- 
-def create_dbricks_conn(**kwargs):
+    # Build SSH connection payload for REST API
+    payload = create_connection_via_api(
+        conn_id=connect_id_name,
+        conn_type='ssh',
+        host=Variable.get(host_name),
+        login=Variable.get(user_id),
+        password='',
+        port=22,
+        description='SSH Connection to '+connect_id,
+        extra=json.dumps({"key_file": priv_key_file_full_nm})
+    )
+    return payload
+
+def prepare_dbricks_conn_payload(**kwargs):
+    """Prepare Databricks connection payload from secrets"""
     print("In "+inspect.stack()[0][3]+" function" )
     set_global_variables()
     connect_id = kwargs['connect_id']
     connect_id_name = connect_id+'_dbricks_conn'
-    # os.environ["AIRFLOW_VAR_DBRICKS_KEY_SECRETS_NM"]="psdl-ro-airflow"
     dbricks_secret_name = 'databricks-application-'+os.environ["AIRFLOW_VAR_DBRICKS_KEY_SECRETS_NM"]
     print("Environment Name:"+app_env_name)
     print("Connect Id :"+connect_id_name)
@@ -196,50 +209,73 @@ def create_dbricks_conn(**kwargs):
     host_val=Variable.get("dbricks_host_url")+".cloud.databricks.com"
     print("The host name of databricks is {0}".format(host_val))
     
-    # Use Airflow SDK to create connection (Airflow 3.0 compatible)
-    try:
-        # Create Databricks connection using Airflow SDK
-        conn = Connection(
-            conn_id=connect_id_name,
-            conn_type='databricks',
-            host=host_val,
-            password=token_val,
-            extra=json.dumps({"description": f"Databricks connection - {connect_id}"})
-        )
-        
-        # Save the connection using database session
-        with Session(engine) as session:
-            # Delete existing connection if it exists
-            existing = session.query(Connection).filter(Connection.conn_id == connect_id_name).first()
-            if existing:
-                session.delete(existing)
-            session.add(conn)
-            session.commit()
-        
-        print(f'Databricks Connection created/updated - {connect_id_name}')
-        
-    except Exception as e:
-        print(f"Error creating Databricks connection: {str(e)}")
+    # Build Databricks connection payload for REST API
+    payload = create_connection_via_api(
+        conn_id=connect_id_name,
+        conn_type='databricks',
+        host=host_val,
+        password=token_val,
+        description='Databricks connection -'+connect_id
+    )
+    return payload
  
  
 default_args = {
     'owner': 'airflow'
 }
- 
+
 with DAG(dag_id='setup',
         start_date=None,
         schedule=None,
-        default_args=default_args
+        catchup=False,
+        default_args=default_args,
+        tags=["api", "infrastructure", "airflow3"]
         ) as dag:
- 
-    ssh_conn_setup = PythonOperator(
-        task_id='ssh_conn_setup',
-        python_callable=create_ssh_conn,
-        op_kwargs={'connect_id' : 'psdlec2'}
+
+    # Task 1: Prepare SSH connection payload
+    prepare_ssh_task = PythonOperator(
+        task_id='prepare_ssh_conn_payload',
+        python_callable=prepare_ssh_conn_payload,
+        op_kwargs={'connect_id': 'psdlec2'},
+        do_xcom_push=True
     )
- 
-    dbricks_conn_setup = PythonOperator(
-        task_id='dbricks_conn_setup',
-        python_callable=create_dbricks_conn,
-        op_kwargs={'connect_id' : 'psdl'}
-    )  
+
+    # Task 2: Create SSH connection via Airflow 3 REST API
+    create_ssh_conn_task = HttpOperator(
+        task_id='post_ssh_connection',
+        method='POST',
+        endpoint='api/v2/connections',
+        http_conn_id='airflow_api_server_conn',
+        data='{{ ti.xcom_pull(task_ids="prepare_ssh_conn_payload") | tojson }}',
+        headers={
+            'Content-Type': 'application/json',
+        },
+        extra_options={'check_response_errors': False},
+        log_response=True,
+    )
+
+    # Task 3: Prepare Databricks connection payload
+    prepare_dbricks_task = PythonOperator(
+        task_id='prepare_dbricks_conn_payload',
+        python_callable=prepare_dbricks_conn_payload,
+        op_kwargs={'connect_id': 'psdl'},
+        do_xcom_push=True
+    )
+
+    # Task 4: Create Databricks connection via Airflow 3 REST API
+    create_dbricks_conn_task = HttpOperator(
+        task_id='post_dbricks_connection',
+        method='POST',
+        endpoint='api/v2/connections',
+        http_conn_id='airflow_api_server_conn',
+        data='{{ ti.xcom_pull(task_ids="prepare_dbricks_conn_payload") | tojson }}',
+        headers={
+            'Content-Type': 'application/json',
+        },
+        extra_options={'check_response_errors': False},
+        log_response=True,
+    )
+
+    # Set task dependencies
+    prepare_ssh_task >> create_ssh_conn_task
+    prepare_dbricks_task >> create_dbricks_conn_task  
