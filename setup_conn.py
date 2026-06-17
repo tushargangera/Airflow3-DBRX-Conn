@@ -1,6 +1,8 @@
 import os, boto3, json, inspect, ast
 from airflow.sdk import DAG, task, Variable, Connection
 from airflow.providers.standard.operators.python import PythonOperator
+from sqlalchemy.orm import Session
+from airflow.settings import engine
  
 # Global Variables setup
 def set_global_variables():
@@ -164,8 +166,15 @@ def create_ssh_conn(**kwargs):
             extra=extra_json
         )
         
-        # Save the connection
-        conn.save()
+        # Save the connection using database session
+        with Session(engine) as session:
+            # Delete existing connection if it exists
+            existing = session.query(Connection).filter(Connection.conn_id == connect_id_name).first()
+            if existing:
+                session.delete(existing)
+            session.add(conn)
+            session.commit()
+        
         print(f'SSH Connection created/updated - {connect_id_name}')
         
     except Exception as e:
@@ -198,8 +207,15 @@ def create_dbricks_conn(**kwargs):
             extra=json.dumps({"description": f"Databricks connection - {connect_id}"})
         )
         
-        # Save the connection
-        conn.save()
+        # Save the connection using database session
+        with Session(engine) as session:
+            # Delete existing connection if it exists
+            existing = session.query(Connection).filter(Connection.conn_id == connect_id_name).first()
+            if existing:
+                session.delete(existing)
+            session.add(conn)
+            session.commit()
+        
         print(f'Databricks Connection created/updated - {connect_id_name}')
         
     except Exception as e:
