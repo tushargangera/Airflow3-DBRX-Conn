@@ -1,4 +1,4 @@
-import os, boto3, json, inspect, ast, subprocess
+import os, boto3, json, inspect, ast
 from airflow.sdk import DAG, task, Variable, Connection
 from airflow.providers.standard.operators.python import PythonOperator
  
@@ -148,34 +148,28 @@ def create_ssh_conn(**kwargs):
     remove_ssh_key_file(connect_id)
     create_ssh_key_file(connect_id)
     
-    # Use Airflow CLI to create connection (Airflow 3.0 compatible)
+    # Use Airflow SDK to create connection (Airflow 3.0 compatible)
     try:
         host_val = Variable.get(host_name)
         user_val = Variable.get(user_id)
         extra_json = json.dumps({"key_file": priv_key_file_full_nm})
         
-        cmd = [
-            'airflow', 'connections', 'add',
-            connect_id_name,
-            '--conn-type', 'ssh',
-            '--conn-host', host_val,
-            '--conn-login', user_val,
-            '--conn-port', '22',
-            '--conn-extra', extra_json
-        ]
+        # Create SSH connection using Airflow SDK
+        conn = Connection(
+            conn_id=connect_id_name,
+            conn_type='ssh',
+            host=host_val,
+            login=user_val,
+            port=22,
+            extra=extra_json
+        )
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print(f'SSH Connection created/updated - {connect_id_name}')
-            print(result.stdout)
-        else:
-            # Connection might already exist, try to update via CLI
-            if 'already exists' in result.stderr:
-                print(f"Connection {connect_id_name} already exists")
-            else:
-                print(f"Error creating connection: {result.stderr}")
+        # Save the connection
+        conn.save()
+        print(f'SSH Connection created/updated - {connect_id_name}')
+        
     except Exception as e:
-        print(f"Error executing airflow CLI: {str(e)}")
+        print(f"Error creating SSH connection: {str(e)}")
  
 def create_dbricks_conn(**kwargs):
     print("In "+inspect.stack()[0][3]+" function" )
@@ -193,29 +187,23 @@ def create_dbricks_conn(**kwargs):
     host_val=Variable.get("dbricks_host_url")+".cloud.databricks.com"
     print("The host name of databricks is {0}".format(host_val))
     
-    # Use Airflow CLI to create connection (Airflow 3.0 compatible)
+    # Use Airflow SDK to create connection (Airflow 3.0 compatible)
     try:
-        cmd = [
-            'airflow', 'connections', 'add',
-            connect_id_name,
-            '--conn-type', 'databricks',
-            '--conn-host', host_val,
-            '--conn-password', token_val,
-            '--conn-extra', json.dumps({"description": f"Databricks connection - {connect_id}"})
-        ]
+        # Create Databricks connection using Airflow SDK
+        conn = Connection(
+            conn_id=connect_id_name,
+            conn_type='databricks',
+            host=host_val,
+            password=token_val,
+            extra=json.dumps({"description": f"Databricks connection - {connect_id}"})
+        )
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print(f'Databricks Connection created/updated - {connect_id_name}')
-            print(result.stdout)
-        else:
-            # Connection might already exist
-            if 'already exists' in result.stderr:
-                print(f"Connection {connect_id_name} already exists")
-            else:
-                print(f"Error creating connection: {result.stderr}")
+        # Save the connection
+        conn.save()
+        print(f'Databricks Connection created/updated - {connect_id_name}')
+        
     except Exception as e:
-        print(f"Error executing airflow CLI: {str(e)}")
+        print(f"Error creating Databricks connection: {str(e)}")
  
  
 default_args = {
